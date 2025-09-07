@@ -28,7 +28,7 @@ function send_headers(res) {
 	res.header("Access-Control-Allow-Origin", '*');
 	res.header("Access-Control-Allow-Methods", 'GET, POST');
  	res.header("Access-Control-Expose-Headers", 'X-Title');
- 	res.header("Content-Type", 'text/markdown');
+ 	res.header("Content-Type", 'text/markdown; charset=utf-8');
 }
 
 function read_url(url, res, options) {

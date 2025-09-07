@@ -3,6 +3,9 @@ const processor = require('./url_to_markdown_processor.js');
 const filters = require('./url_to_markdown_common_filters.js');
 const JSDOM = require('jsdom').JSDOM;
 const https = require('https');
+const http = require('http');
+const { URL } = require('url');
+const zlib = require('zlib');
 
 const failure_message  = "Sorry, could not fetch and convert that URL";
 
@@ -10,49 +13,134 @@ const apple_dev_prefix = "https://developer.apple.com";
 const stackoverflow_prefix = "https://stackoverflow.com/questions";
 
 const timeoutMs = 15 * 1000;
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 32 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 32 });
+const MAX_BYTES = 10 * 1024 * 1024;
 
-function fetch_url (url, success, failure) {
+function fetch_url (inputUrl, success, failure, redirectCount = 0, state) {
+  const MAX_REDIRECTS = 5;
+  if (!state) state = { cookie: '', referer: inputUrl };
 
-	let fetch = new Promise((resolve, reject) => {
+  try {
+    const u = new URL(inputUrl);
+    const isHttps = (u.protocol === 'https:');
+    if (!isHttps && u.protocol !== 'http:') {
+      return failure(400);
+    }
+    const client = isHttps ? https : http;
+    const agent = isHttps ? httpsAgent : httpAgent;
 
-		let timedOut = false;
+    const headers = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Referer': state.referer
+    };
+    if (state.cookie) headers['Cookie'] = state.cookie;
 
-		const timeout = setTimeout(() => {
-			timedOut = true;
-		}, timeoutMs);		
+    const req = client.get(u, { agent, headers }, (res) => {
+      const status = res.statusCode || 0;
 
-		const req = https.get(url, (res) => {
-			clearTimeout(timeout);
+      // Accumulate cookies for subsequent hops
+      const set = res.headers['set-cookie'];
+      if (Array.isArray(set)) {
+        const kv = set.map(c => c.split(';')[0]).join('; ');
+        state.cookie = state.cookie ? `${state.cookie}; ${kv}` : kv;
+      }
 
-		    let result = "";
-		    res.on("data", (chunk) => {
-		        result += chunk;
-		    });
-		    res.on("end", () => {
-		    	if (!timedOut && res.statusCode >= 200 && res.statusCode < 300) {
-		    		resolve(result);
-		    	} else {
-		    		reject(res.statusCode);
-		    	}
-		    });
-		});
+      // Follow redirects
+      if ([301, 302, 303, 307, 308].includes(status)) {
+        const location = res.headers.location;
+        if (!location) { res.resume(); return failure(status); }
+        if (redirectCount >= MAX_REDIRECTS) { res.resume(); return failure(310); }
+        const nextUrl = new URL(location, u).toString();
+        res.resume();
+        state.referer = u.toString();
+        return fetch_url(nextUrl, success, failure, redirectCount + 1, state);
+      }
 
-		req.on('error', (err) => {
-			clearTimeout(timeout);      
-			reject();
-	    });
+      // Non-2xx
+      if (status < 200 || status >= 300) {
+        res.resume();
+        return failure(status);
+      }
 
-		req.on('timeout', () => {
-			clearTimeout(timeout);
-			req.destroy();
-			reject();
-	    });
+      // Decompress if needed
+      let stream = res;
+      const enc = (res.headers['content-encoding'] || '').toLowerCase();
+      try {
+        if (enc.includes('br')) {
+          stream = res.pipe(zlib.createBrotliDecompress());
+        } else if (enc.includes('gzip')) {
+          stream = res.pipe(zlib.createGunzip());
+        } else if (enc.includes('deflate')) {
+          stream = res.pipe(zlib.createInflate());
+        }
+      } catch (e) {
+        res.resume();
+        return failure();
+      }
 
-	    req.setTimeout(timeoutMs); 
+      // Read with size limit
+      const chunks = [];
+      let total = 0;
+      stream.on('data', (chunk) => {
+        total += chunk.length;
+        if (total > MAX_BYTES) {
+          try { stream.destroy(); } catch {}
+          try { req.destroy(); } catch {}
+          return failure(413); // Payload too large
+        }
+        chunks.push(chunk);
+      });
 
-	});
+      stream.on('end', () => {
+        const buffer = Buffer.concat(chunks);
 
-	fetch.then( (response) => success(response) ).catch( (code) => failure(code) );
+        // Handle meta refresh redirects (immediate)
+        const headAscii = buffer.slice(0, 4096).toString('ascii');
+        const metaRefresh = headAscii.match(/http-equiv=["']?refresh["']?[^>]*content=["']?\s*(\d+)\s*;\s*url=([^"'>\s]+)/i);
+        if (metaRefresh) {
+          const delay = parseInt(metaRefresh[1], 10);
+          if (!Number.isNaN(delay) && delay <= 2 && redirectCount < MAX_REDIRECTS) {
+            const refreshUrl = new URL(metaRefresh[2], u).toString();
+            return fetch_url(refreshUrl, success, failure, redirectCount + 1, state);
+          }
+        }
+
+        // Detect charset from headers or meta tag
+        const contentType = res.headers['content-type'] || '';
+        let m = contentType.match(/charset=([^;]+)/i);
+        let charset = m ? m[1].trim().toLowerCase() : null;
+
+        if (!charset) {
+          let m1 = headAscii.match(/<meta[^>]+charset=["']?\s*([a-zA-Z0-9_-]+)/i);
+          if (m1) charset = m1[1].trim().toLowerCase();
+          let m2 = headAscii.match(/<meta[^>]+http-equiv=["']content-type["'][^>]*content=["'][^"']*charset=([^"'>\s]+)/i);
+          if (!charset && m2) charset = m2[1].trim().toLowerCase();
+        }
+        if (!charset) charset = 'utf-8';
+
+        let html;
+        if (charset === 'iso-8859-1' || charset === 'latin1' || charset === 'windows-1252') {
+          html = buffer.toString('latin1');
+        } else {
+          html = buffer.toString('utf8');
+        }
+
+        success(html);
+      });
+      stream.on('error', () => failure());
+    });
+
+    req.setTimeout(timeoutMs, () => {
+      req.destroy();
+      failure();
+    });
+    req.on('error', (err) => failure(err));
+  } catch (e) {
+    failure(e);
+  }
 }
 
 class html_reader {
@@ -80,7 +168,7 @@ class html_reader {
 class apple_reader {
 	read_url(url, res, options) {
 		let json_url = apple_dev_parser.dev_doc_url(url);
-		fetch_url.get(json_url, (body) => {	
+		fetch_url(json_url, (body) => {	
             let json = JSON.parse(body);
             let markdown = apple_dev_parser.parse_dev_doc_json(json, options);
             res.send(markdown);
